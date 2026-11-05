@@ -1611,6 +1611,9 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
+	if input.CreatedAt.IsZero() {
+		input.CreatedAt = time.Now()
+	}
 	// Grok usage belongs to the credential generation that actually dispatched
 	// this attempt. Resolve it from AccountID at the common sink so success,
 	// failure and transport-retry paths cannot accidentally omit it. A retry
