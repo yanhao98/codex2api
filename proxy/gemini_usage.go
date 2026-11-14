@@ -63,3 +63,22 @@ func geminiNativeHasContent(body []byte) bool {
 	}
 	return false
 }
+
+// geminiNativeIsProgressFrame 判断上游 Gemini SSE 帧是否证明上游已经开始产出
+// 真实响应（包括思考帧、正文、工具调用、finishReason 或非空用量元数据），
+// 仅忽略 `{}` 等空心跳帧。用于在首个有效响应帧到达时解除首字超时看门狗，
+// 避免长推理中途被误中断。
+func geminiNativeIsProgressFrame(body []byte) bool {
+	if geminiNativeHasContent(body) {
+		return true
+	}
+	parsed := gjson.ParseBytes(body)
+	if len(parsed.Get("candidates").Array()) > 0 {
+		return true
+	}
+	if parsed.Get("promptFeedback").Exists() {
+		return true
+	}
+	metadata := parsed.Get("usageMetadata")
+	return metadata.IsObject() && len(metadata.Map()) > 0
+}

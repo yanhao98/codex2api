@@ -325,3 +325,205 @@ func TestGeminiNativeNonStreamStillReturnsCompleteAnswer(t *testing.T) {
 	}
 	assertGeminiStreamUsageStatus(t, db, http.StatusOK, false)
 }
+
+func newGeminiStreamMultiAccountTestHandler(t *testing.T, maxRetries int, upstreamHandler http.HandlerFunc) (*gin.Engine, *auth.Store, *database.DB) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "gemini-ttft.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	db.SetUsageLogConfig(database.UsageLogModeFull, 100, 60)
+	keyID, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name: "Gemini TTFT test", Key: "gemini-ttft-test-key",
+		Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelAntigravity},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := db.GetAPIKeyByID(context.Background(), keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		upstreamHandler(w, r)
+	}))
+	t.Cleanup(func() {
+		upstream.CloseClientConnections()
+		upstream.Close()
+	})
+	previousBases := antigravityOAuthEndpointBases
+	antigravityOAuthEndpointBases = []string{upstream.URL}
+	t.Cleanup(func() { antigravityOAuthEndpointBases = previousBases })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, MaxRetries: maxRetries})
+	store.SetMaxRetries(maxRetries)
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{
+		DBID: 8414, UpstreamType: auth.UpstreamAntigravity,
+		AccessToken: "token-8414", AntigravityProjectID: "proj-8414",
+		Models: []string{"gemini-3.7-flash-tiered"}, HealthTier: auth.HealthTierHealthy, Status: auth.StatusReady,
+	})
+	store.AddAccount(&auth.Account{
+		DBID: 8415, UpstreamType: auth.UpstreamAntigravity,
+		AccessToken: "token-8415", AntigravityProjectID: "proj-8415",
+		Models: []string{"gemini-3.7-flash-tiered"}, HealthTier: auth.HealthTierHealthy, Status: auth.StatusReady,
+	})
+	handler := NewHandler(store, db, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(contextAPIKeyRow, key)
+		c.Next()
+	})
+	router.POST("/v1beta/models/*action", handler.GeminiModelsAction)
+	return router, store, db
+}
+
+func TestGeminiNativeStreamFirstTokenTimeoutRotatesAccount(t *testing.T) {
+	previousTimeout := geminiFirstTokenTimeoutFor
+	geminiFirstTokenTimeoutFor = func() time.Duration { return 35 * time.Millisecond }
+	t.Cleanup(func() { geminiFirstTokenTimeoutFor = previousTimeout })
+
+	for _, tc := range []struct {
+		name         string
+		sendHeaders  bool
+		keepaliveInt time.Duration
+	}{
+		{name: "hangs before response headers", sendHeaders: false},
+		{name: "hangs after 200 SSE headers", sendHeaders: true},
+		{name: "hangs after 200 SSE headers with keepalive committed", sendHeaders: true, keepaliveInt: 10 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.keepaliveInt > 0 {
+				previousInterval := continuousRetryKeepaliveInterval
+				continuousRetryKeepaliveInterval = tc.keepaliveInt
+				t.Cleanup(func() { continuousRetryKeepaliveInterval = previousInterval })
+			}
+			var mu sync.Mutex
+			seenTokens := make([]string, 0, 2)
+			firstCanceled := make(chan struct{})
+			var cancelOnce sync.Once
+			router, store, db := newGeminiStreamMultiAccountTestHandler(t, 1, func(w http.ResponseWriter, r *http.Request) {
+				authHeader := r.Header.Get("Authorization")
+				mu.Lock()
+				attempt := len(seenTokens)
+				seenTokens = append(seenTokens, authHeader)
+				mu.Unlock()
+				if attempt == 0 {
+					if tc.sendHeaders {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+					}
+					<-r.Context().Done()
+					cancelOnce.Do(func() { close(firstCanceled) })
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: "+geminiStreamTestAnswer+"\n\n")
+				w.(http.Flusher).Flush()
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, geminiStreamTestHTTPRequest(ctx, "streamGenerateContent"))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200 after rotating account", recorder.Code, recorder.Body.String())
+			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "ANSWER TEST_END") || !strings.Contains(body, `"finishReason":"STOP"`) {
+				t.Fatalf("missing retried answer in body: %s", body)
+			}
+			select {
+			case <-firstCanceled:
+			case <-time.After(time.Second):
+				t.Fatal("first stalled upstream attempt was not canceled by TTFT guard")
+			}
+			mu.Lock()
+			if len(seenTokens) != 2 || seenTokens[0] == seenTokens[1] {
+				mu.Unlock()
+				t.Fatalf("expected rotation across 2 distinct accounts, got tokens=%v", seenTokens)
+			}
+			firstToken := seenTokens[0]
+			mu.Unlock()
+
+			// Soft TTFT exclusion should not penalize the timed-out account's health.
+			firstAccountID := int64(8414)
+			if firstToken == "Bearer token-8415" {
+				firstAccountID = 8415
+			}
+			if acc := store.FindByID(firstAccountID); acc == nil || acc.HealthTier != auth.HealthTierHealthy {
+				t.Fatalf("timed-out account %d penalized: %+v", firstAccountID, acc)
+			}
+			entry := assertGeminiStreamUsageStatus(t, db, http.StatusOK, true)
+			if entry.AttemptIndex != 2 {
+				t.Fatalf("usage AttemptIndex = %d, want 2", entry.AttemptIndex)
+			}
+		})
+	}
+}
+
+func TestGeminiNativeStreamThoughtFrameDisarmsFirstTokenTimeout(t *testing.T) {
+	previousTimeout := geminiFirstTokenTimeoutFor
+	geminiFirstTokenTimeoutFor = func() time.Duration { return 35 * time.Millisecond }
+	t.Cleanup(func() { geminiFirstTokenTimeoutFor = previousTimeout })
+
+	router, db := newGeminiStreamTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: "+geminiStreamTestThought+"\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(90 * time.Millisecond):
+			_, _ = io.WriteString(w, "data: "+geminiStreamTestAnswer+"\n\n")
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, geminiStreamTestHTTPRequest(ctx, "streamGenerateContent"))
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "THOUGHT_ONLY") || !strings.Contains(body, "ANSWER TEST_END") {
+		t.Fatalf("thought frame did not disarm TTFT guard: status=%d body=%s", recorder.Code, body)
+	}
+	assertGeminiStreamUsageStatus(t, db, http.StatusOK, true)
+}
+
+func TestGeminiNativeStreamFirstTokenTimeoutExhaustedReturns504(t *testing.T) {
+	previousTimeout := geminiFirstTokenTimeoutFor
+	geminiFirstTokenTimeoutFor = func() time.Duration { return 30 * time.Millisecond }
+	t.Cleanup(func() { geminiFirstTokenTimeoutFor = previousTimeout })
+
+	for _, sendHeaders := range []bool{false, true} {
+		name := "before headers"
+		if sendHeaders {
+			name = "after 200 SSE headers"
+		}
+		t.Run(name, func(t *testing.T) {
+			router, store, _ := newGeminiStreamMultiAccountTestHandler(t, 0, func(w http.ResponseWriter, r *http.Request) {
+				if sendHeaders {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+				}
+				<-r.Context().Done()
+			})
+			_ = store
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, geminiStreamTestHTTPRequest(ctx, "streamGenerateContent"))
+			body := recorder.Body.String()
+			if recorder.Code != http.StatusGatewayTimeout ||
+				gjson.Get(body, "error.code").Int() != http.StatusGatewayTimeout ||
+				gjson.Get(body, "error.status").String() != "DEADLINE_EXCEEDED" {
+				t.Fatalf("status=%d body=%s, want Gemini 504 DEADLINE_EXCEEDED", recorder.Code, body)
+			}
+		})
+	}
+}

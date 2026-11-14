@@ -254,9 +254,17 @@ func executeAntigravityOAuthRequest(ctx context.Context, account *auth.Account, 
 	for headerAttempt := 0; headerAttempt < 2; headerAttempt++ {
 		retryWithoutUserProject := false
 		for _, base := range antigravityOAuthEndpointList() {
+			if err := ctx.Err(); err != nil {
+				discardLastRetryable()
+				return nil, err
+			}
 			endpoint := strings.TrimRight(base, "/") + "/v1internal:" + method + query
 			var resp *http.Response
 			for {
+				if err := ctx.Err(); err != nil {
+					discardLastRetryable()
+					return nil, err
+				}
 				req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 				if reqErr != nil {
 					return nil, reqErr
@@ -274,6 +282,10 @@ func executeAntigravityOAuthRequest(ctx context.Context, account *auth.Account, 
 				}
 				resp, doErr = doTracedUpstreamRequest(client, req, account, proxyURL)
 				if doErr != nil {
+					if err := ctx.Err(); err != nil {
+						discardLastRetryable()
+						return nil, err
+					}
 					last = doErr
 					resp = nil
 					break

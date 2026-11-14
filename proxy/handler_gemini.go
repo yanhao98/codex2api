@@ -20,6 +20,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+var geminiFirstTokenTimeoutFor = currentFirstTokenTimeout
+
 var geminiNativeGenerationMethods = []string{
 	"generateContent",
 	"streamGenerateContent",
@@ -390,6 +392,7 @@ func geminiInboundEndpoint(stream bool) string {
 type geminiNativeStreamResult struct {
 	usage        UsageInfo
 	firstTokenMs int
+	wroteAnyBody bool
 	readErr      error
 	writeErr     error
 }
@@ -404,11 +407,21 @@ func forwardGeminiNativeStream(c *gin.Context, body io.Reader, startedAt time.Ti
 // forwardGeminiNativeStreamGuarded 在逐帧写出之前执行 Gemini 投影与 Guard 判定。
 // guard 为 nil 时保持原有转发语义，供不关心 Guard 的既有调用方复用。
 func forwardGeminiNativeStreamGuarded(c *gin.Context, body io.Reader, startedAt time.Time, guard *outputguard.RequestGuard, coord *GuardTerminationCoordinator, projector ProtocolProjector) geminiNativeStreamResult {
+	return forwardGeminiNativeStreamGuardedWithTTFT(c, c.Request.Context(), body, startedAt, guard, coord, projector, nil)
+}
+
+// forwardGeminiNativeStreamGuardedWithTTFT 在读流期间同时维护上游取消感知（如
+// 首字超时看门狗）与逐帧 Guard 判定：仅在收到首个有效响应帧后才提交 SSE 200 头
+// 与写出内容，从而允许首包前超时/断流在尚未写过正文时透明切号重试。
+func forwardGeminiNativeStreamGuardedWithTTFT(c *gin.Context, readCtx context.Context, body io.Reader, startedAt time.Time, guard *outputguard.RequestGuard, coord *GuardTerminationCoordinator, projector ProtocolProjector, ttftGuard *firstTokenTimeoutGuard) geminiNativeStreamResult {
+	if readCtx == nil {
+		readCtx = c.Request.Context()
+	}
 	var result geminiNativeStreamResult
 	var usage geminiNativeUsage
-	activateContinuousRetryKeepalive(c.Request.Context())
-	result.readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), body, func(_ string, data []byte) bool {
-		if c.Request.Context().Err() != nil {
+	activateContinuousRetryKeepalive(readCtx)
+	result.readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, body, func(_ string, data []byte) bool {
+		if readCtx.Err() != nil || ttftGuard.TimedOut() {
 			return false
 		}
 		// [OutputGuard 前置检查] 逐 candidate parts 追加检测；绝不能因为某个
@@ -427,9 +440,19 @@ func forwardGeminiNativeStreamGuarded(c *gin.Context, body io.Reader, startedAt 
 				return false
 			}
 		}
+		if geminiNativeIsProgressFrame(data) {
+			ttftGuard.MarkFirstToken()
+		}
+		if readCtx.Err() != nil || ttftGuard.TimedOut() {
+			return false
+		}
 		usage.observe(data)
 		if result.firstTokenMs == 0 && !startedAt.IsZero() && geminiNativeHasContent(data) {
 			result.firstTokenMs = max(int(time.Since(startedAt).Milliseconds()), 1)
+		}
+		if !c.Writer.Written() {
+			setSSEStreamHeaders(c, "text/event-stream; charset=utf-8")
+			c.Status(http.StatusOK)
 		}
 		frame := "data: " + string(data) + "\n\n"
 		var written int
@@ -440,9 +463,13 @@ func forwardGeminiNativeStreamGuarded(c *gin.Context, body io.Reader, startedAt 
 		if result.writeErr != nil {
 			return false
 		}
+		result.wroteAnyBody = true
 		c.Writer.Flush()
 		return true
 	})
+	if result.readErr == nil && readCtx.Err() != nil && result.writeErr == nil {
+		result.readErr = continuousRetryContextError(readCtx)
+	}
 	result.usage = usage.usageInfo()
 	return result
 }
@@ -561,6 +588,13 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	var selectionErr error
 	var account *auth.Account
 	var stickyProxyURL string
+	capacityShedRetries := map[int64]int{}
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
@@ -574,16 +608,28 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				h.sendGeminiFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				if retryKeepaliveCommitted(c) {
+					writeGeminiNativeError(c, http.StatusTooManyRequests, msg)
+					return
+				}
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 				return
 			}
 			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
+				if retryKeepaliveCommitted(c) {
+					writeGeminiNativeError(c, http.StatusServiceUnavailable, "Concurrency limit reached")
+					return
+				}
 				setConcurrencySaturatedRetryAfter(c)
 				c.JSON(http.StatusServiceUnavailable, concurrencySaturatedError())
+				return
+			}
+			if retryKeepaliveCommitted(c) {
+				writeGeminiNativeError(c, http.StatusServiceUnavailable, fmt.Sprintf("No available account for model %s", model))
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(model))
@@ -602,8 +648,18 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 
 		// Native Gemini forwards the stream directly and does not drain usage
 		// after a disconnect. Keep this context alive through body consumption,
-		// while letting a canceled client stop a blocked upstream read immediately.
+		// while letting a canceled client or first-token timeout stop a blocked
+		// upstream read immediately.
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
 		upstreamCtx, upstreamCancel := context.WithCancel(c.Request.Context())
+		lastUpstreamCancel = upstreamCancel
+		attemptFirstTokenTimeout := geminiFirstTokenTimeoutFor()
+		var ttftGuard *firstTokenTimeoutGuard
+		if stream {
+			ttftGuard = newFirstTokenTimeoutGuard(attemptFirstTokenTimeout, upstreamCancel)
+		}
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 			return ExecuteAntigravityGeminiRequest(upstreamCtx, account, model, rawBody, stream, proxyURL)
 		})
@@ -611,32 +667,62 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
 
 		if reqErr != nil {
-			upstreamCancel()
 			if apiKeyModelRequestError(reqErr) != nil {
+				ttftGuard.Stop()
+				upstreamCancel()
 				h.store.Release(account)
 				sendAPIKeyModelRequestQuotaError(c, reqErr)
 				return
 			}
+			timedOut := ttftGuard.TimedOut()
+			ttftGuard.Stop()
+			upstreamCancel()
+			if timedOut {
+				reqErr = firstTokenTimeoutError(attemptFirstTokenTimeout)
+			}
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
-			if kind := classifyTransportFailure(reqErr); retryable && shouldPenalizeTransportKind(kind) {
+			shouldRetry := false
+			if retryable {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
+			}
+			kind := classifyTransportFailure(reqErr)
+			if retryable && shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			if !retryable || !shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy) {
+			if retryable {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			if timedOut && shouldRetry {
+				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
+				retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
+				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+				log.Printf("Gemini native 上游首字超时，断开并重试 (attempt %s, account %d, %s): %v", retryAttemptProgress(attempt, maxRetries), account.ID(), inboundEndpoint, reqErr)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), true, generalRetries, retryLimit) {
+					return
+				}
+				continue
+			}
+			if !retryable || !shouldRetry {
 				if claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) && c.Request.Context().Err() == nil {
-					writeGeminiNativeError(c, StatusCodeFromError(reqErr), "Upstream Gemini request failed")
+					msg := "Upstream Gemini request failed"
+					if timedOut {
+						msg = fmt.Sprintf("Upstream Gemini request timed out waiting for first token after %s", attemptFirstTokenTimeout.Round(time.Millisecond))
+					}
+					writeGeminiNativeError(c, StatusCodeFromError(reqErr), msg)
 				}
 				return
 			}
+			rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
 			retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
-			if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, maxRetries) {
+			if !h.waitBeforeRetryWithBudget(c.Request.Context(), generalRetries, continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)) {
 				return
 			}
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			_ = resp.Body.Close()
@@ -697,7 +783,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolGemini) {
 				return
 			}
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			h.sendGeminiFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -708,12 +794,9 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 		guardCoord := NewGuardTerminationCoordinator(requestGuard, upstreamCancel, resp.Body)
 
 		if stream {
-			c.Header("Content-Type", "text/event-stream; charset=utf-8")
-			c.Header("Cache-Control", "no-cache")
-			c.Header("Connection", "keep-alive")
-			c.Header("X-Accel-Buffering", "no")
-			c.Status(resp.StatusCode)
-			result := forwardGeminiNativeStreamGuarded(c, resp.Body, start, requestGuard, guardCoord, attemptProjector)
+			result := forwardGeminiNativeStreamGuardedWithTTFT(c, upstreamCtx, resp.Body, start, requestGuard, guardCoord, attemptProjector, ttftGuard)
+			timedOut := ttftGuard.TimedOut() && !result.wroteAnyBody
+			ttftGuard.Stop()
 			_ = resp.Body.Close()
 			upstreamCancel()
 			h.store.Release(account)
@@ -722,17 +805,46 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			// The native reader only returns a clean EOF after a real Gemini
 			// terminal. A successful upstream read still requires delivery to the
 			// downstream client before this request can be recorded as successful.
-			completed := result.readErr == nil && result.writeErr == nil && ctxErr == nil
+			completed := result.readErr == nil && result.writeErr == nil && ctxErr == nil && !timedOut
 			outcome := classifyStreamOutcome(ctxErr, result.readErr, result.writeErr, completed)
 			var upstreamStreamErr *antigravityStreamError
 			if ctxErr == nil && result.writeErr == nil && errors.As(result.readErr, &upstreamStreamErr) {
 				outcome = h.antigravityStreamErrorOutcome(account, upstreamStreamErr, resp, model)
 			}
-			if !claimContinuousRetrySuccessContext(c.Request.Context()) {
-				outcome = classifyStreamOutcome(errContinuousRetryDeadlineExceeded, nil, nil, false)
+			if timedOut && !completed {
+				outcome = firstTokenTimeoutOutcome(attemptFirstTokenTimeout)
 			}
 			// Guard 终态绝对覆盖 499/598/continuation 分类，绝不允许断流分类遮蔽。
 			outcome = OverlayGuardOutcome(outcome, requestGuard)
+			if shouldTransparentRetryStreamWithBudgets(outcome, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, result.wroteAnyBody, c.Request.Context().Err(), result.writeErr, continuousRetryPolicy) {
+				var failurePayload []byte
+				if upstreamStreamErr != nil {
+					failurePayload = upstreamStreamErr.Body
+				}
+				rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, failurePayload)
+				if isFirstTokenTimeoutOutcome(outcome) {
+					log.Printf("Gemini native 上游首字超时，断开并重试 (attempt %s, account %d, %s): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), inboundEndpoint, outcome.failureMessage)
+					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				} else {
+					log.Printf("Gemini native 上游流在首包前断开，重置连接并重试 (attempt %s, account %d, %s): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), inboundEndpoint, outcome.failureMessage)
+					h.reportStreamOutcomeFailure(account, outcome, time.Since(start))
+					h.unbindOrRetainAffinityForCapacityShedWithGuard(retryExclusions, affinityKey, account, proxyURL, affinityGuard, outcome, capacityShedRetries, continuousRetryPolicy)
+					if !outcome.capacityShed &&
+						retryLimitForStreamOutcome(outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) == -1 {
+						retryExclusions.MarkStreamFailure(account.ID(), outcome, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+					}
+				}
+				retryOrdinal, retryLimit := retryStateForStreamOutcome(outcome, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				if !h.waitBeforeRetryWithFirstTokenTimeout(c.Request.Context(), isFirstTokenTimeoutOutcome(outcome), retryOrdinal, retryLimit, resp) {
+					return
+				}
+				continue
+			}
+			if !claimContinuousRetrySuccessContext(c.Request.Context()) {
+				outcome = classifyStreamOutcome(errContinuousRetryDeadlineExceeded, nil, nil, false)
+				outcome = OverlayGuardOutcome(outcome, requestGuard)
+			}
 			if outcome.penalize {
 				h.reportStreamOutcomeFailure(account, outcome, time.Since(start))
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -740,7 +852,10 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			if outcome.logStatusCode != http.StatusOK && !outcome.guardTripped {
 				if !writeContinuousRetryTimeoutResponse(c, continuousRetryProtocolGemini) && ctxErr == nil && result.writeErr == nil {
 					status, message := http.StatusBadGateway, "Upstream Gemini stream failed before completion"
-					if upstreamStreamErr != nil {
+					if isFirstTokenTimeoutOutcome(outcome) {
+						status = http.StatusGatewayTimeout
+						message = outcome.failureMessage
+					} else if upstreamStreamErr != nil {
 						// Gemini clients retry RESOURCE_EXHAUSTED/UNAVAILABLE themselves,
 						// so keep the upstream status instead of a generic 502.
 						status = upstreamStreamErr.StatusCode
@@ -840,4 +955,16 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 		})
 		return
 	}
+}
+
+func (h *Handler) sendGeminiFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	if retryKeepaliveCommitted(c) {
+		message := usageLogErrorMessage(statusCode, body)
+		if message == "" {
+			message = fmt.Sprintf("Upstream Gemini returned HTTP %d", statusCode)
+		}
+		writeGeminiNativeError(c, statusCode, message)
+		return
+	}
+	h.sendFinalUpstreamError(c, statusCode, body)
 }
